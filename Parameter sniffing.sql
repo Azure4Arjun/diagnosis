@@ -34,8 +34,29 @@ OPTION (OPTIMIZE FOR (@City = 'Mentor'));
 
 exec dbo.addressbycity @city = 'London';
 
+--before parameter snnipig
+CREATE PROCEDURE Customer_Search
+ @FirstName varchar(100),
+ @LastName varchar(100)
+AS
+BEGIN
 
---method 1
+ SELECT 
+  CustomerID,
+  Firstname,
+  Lastname,
+  Username,
+  Email
+ FROM
+  Customer
+ WHERE
+  Firstname LIKE ('%' + @FirstName + '%') AND
+  LastName LIKE ('%' + @LastName + '%')
+END
+GO
+
+
+--method 1  after implimentation of parameter snniffing
 CREATE PROCEDURE Customer_Search
  @FirstName varchar(100),
  @LastName varchar(100)
