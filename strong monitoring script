@@ -1,0 +1,1354 @@
+/********************************************************************************************
+***  Session Momitoring using sp_whoisactive ***
+------------------------------------------------
+I have prepared this script to monitor currently running sessions
+in different scenarios like CPU, Blocking, So first you need to
+create sp_whoisactive stored procedure, please downad it from the link,
+https://github.com/SqlAdmin/AwesomeSQLServer/blob/master/T-SQL%20Scripts/sp_whoisactive.sql
+*******************************************************************************************/ 
+
+
+-- To get overall info about current sessions
+
+EXEC sp_whoisactive
+
+
+------------------------------------------------
+/*** 1. Currently running sessions CPU time ***/
+------------------------------------------------
+
+EXEC sp_WhoIsActive @get_plans = 1,
+                    @get_avg_time = 1,
+                    @output_column_list = '[dd%][session_id][database_name][cpu%][sql_text]',
+                    @sort_order = '[start_time] ASC'
+
+
+-----------------------------------------------------------
+/*** 2. Currently running sessions memory pages usage ***/
+-----------------------------------------------------------
+
+EXEC sp_WhoIsActive @output_column_list = '[dd%][session_id][database_name][sql_text][used_memory][tempdb_allocations][tempdb_current]',
+                    @sort_order = '[start_time] ASC';
+
+
+--------------------------------------------------------------
+/*** 3. Currently running query, batch and execution plan ***/
+--------------------------------------------------------------                   
+
+EXEC sp_WhoIsActive @get_full_inner_text = 1,
+                    @get_plans = 1,
+                    @get_outer_command = 1,
+                    @output_column_list = '[dd%][session_id][database_name][sql_text][sql_command][query_plan]',
+                    @sort_order = '[start_time] ASC';
+
+
+-----------------------------------------------------------------
+/*** 4. Monitor Transaction log writing process of a session ***/
+----------------------------------------------------------------- 
+
+EXEC sp_WhoIsActive @get_transaction_info = 1,
+                    @output_column_list = '[dd%][session_id][database_name][tran_log_writes]',
+                    @sort_order = '[start_time] ASC';
+
+
+
+					--=========================================--
+/*** SQL SERVER CPU MONITORING QUERIES ***/
+--=========================================------
+-- Supported Versions SQL server 2008 and higher
+-------------------------------------------------
+
+-------------------------------------
+/*** 1. Current CPU Utilization ***/
+-------------------------------------
+
+DECLARE @ts BIGINT; 
+DECLARE @lastNmin TINYINT; 
+
+SELECT @ts = (SELECT cpu_ticks / ( cpu_ticks / ms_ticks ) 
+              FROM   sys.dm_os_sys_info); 
+
+SELECT TOP(1) Dateadd(ms, -1 * ( @ts - [timestamp] ), Getdate())AS [EventTime], 
+              sqlprocessutilization                             AS 
+              [SQL Server Utilization], 
+              100 - systemidle - sqlprocessutilization          AS 
+              [Other Process CPU_Utilization], 
+              systemidle                                        AS [System Idle] 
+FROM   (SELECT 
+record.value('(./Record/@id)[1]', 'int')                                                  AS record_id, 
+record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int')        AS [SystemIdle], 
+record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'int')AS [SQLProcessUtilization], 
+[timestamp] 
+ FROM   (SELECT[timestamp], 
+               CONVERT(XML, record) AS [record] 
+         FROM   sys.dm_os_ring_buffers 
+         WHERE  ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' 
+                AND record LIKE'%%')AS x)AS y 
+ORDER  BY record_id DESC; 
+
+
+---------------------------------------------
+/*** 2.CPU Utilization for last N minutes***/
+---------------------------------------------
+-- Mention the minutes in @lastNmin Parameter
+
+DECLARE @ts BIGINT; 
+DECLARE @lastNmin TINYINT; 
+
+SET @lastNmin = 15; --Mention the Minutes Here 
+
+SELECT @ts = (SELECT cpu_ticks / ( cpu_ticks / ms_ticks ) 
+              FROM   sys.dm_os_sys_info); 
+
+SELECT TOP(@lastNmin) Dateadd(ms, -1 * ( @ts - [timestamp] ), Getdate())AS 
+                      [EventTime], 
+                      sqlprocessutilization                             AS 
+                      [SQL Server Utilization], 
+                      100 - systemidle - sqlprocessutilization          AS 
+                      [Other Process CPU_Utilization], 
+                      systemidle                                        AS 
+                      [System Idle] 
+FROM   (SELECT 
+record.value('(./Record/@id)[1]', 'int')                                                  AS record_id, 
+record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int')        AS [SystemIdle], 
+record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'int')AS [SQLProcessUtilization], 
+[timestamp] 
+ FROM   (SELECT[timestamp], 
+               CONVERT(XML, record) AS [record] 
+         FROM   sys.dm_os_ring_buffers 
+         WHERE  ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' 
+                AND record LIKE'%%')AS x)AS y 
+ORDER  BY record_id DESC; 
+
+
+------------------------------------------
+/*** 3.Database wise CPU Utilization ***/
+------------------------------------------
+
+WITH db_cpu 
+     AS (SELECT databaseid, 
+                Db_name(databaseid)   AS [DatabaseName], 
+                Sum(total_worker_time)AS [CPU_Time(Ms)] 
+         FROM   sys.dm_exec_query_stats AS qs 
+                CROSS apply(SELECT CONVERT(INT, value)AS [DatabaseID] 
+                            FROM   sys.Dm_exec_plan_attributes(qs.plan_handle) 
+                            WHERE  attribute = N'dbid')AS epa 
+         GROUP  BY databaseid) 
+SELECT Row_number() 
+         OVER( 
+           ORDER BY [cpu_time(ms)] DESC)                             AS [SNO], 
+       databasename                                                  AS [DBName] 
+       , 
+       [cpu_time(ms)], 
+       Cast([cpu_time(ms)] * 1.0 / Sum([cpu_time(ms)]) 
+                                     OVER() * 100.0 AS DECIMAL(5, 2))AS 
+       [CPUPercent] 
+FROM   db_cpu 
+WHERE  databaseid > 4 -- system databases  
+       AND databaseid <> 32767 -- ResourceDB  
+ORDER  BY sno 
+OPTION(recompile); 
+
+
+---------------------------------------
+/*** 4.Query Wise CPU Utilization ***/
+---------------------------------------
+-- This Query will show the queries and its CPU time if the avg CPU usgae is > 50
+-- You can modify this in IF @AvgCPUUtilization >= 50
+
+SET nocount ON 
+
+DECLARE @ts_now BIGINT 
+DECLARE @AvgCPUUtilization DECIMAL(10, 2) 
+
+SELECT @ts_now = cpu_ticks / ( cpu_ticks / ms_ticks ) 
+FROM   sys.dm_os_sys_info 
+
+-- load the CPU utilization in the past 10 minutes into the temp table, you can load them into a permanent table
+SELECT TOP(10) sqlprocessutilization                                  AS 
+               [SQLServerProcessCPUUtilization], 
+               systemidle                                             AS 
+               [SystemIdleProcess], 
+               100 - systemidle - sqlprocessutilization               AS 
+               [OtherProcessCPU Utilization], 
+               Dateadd(ms, -1 * ( @ts_now - [timestamp] ), Getdate()) AS 
+               [EventTime] 
+INTO   #cpuutilization 
+FROM   (SELECT record.value('(./Record/@id)[1]', 'int') 
+                      AS record_id, 
+record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 
+'int') 
+               AS [SystemIdle], 
+record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'int') AS [SQLProcessUtilization], 
+[timestamp] 
+ FROM   (SELECT [timestamp], 
+                CONVERT(XML, record) AS [record] 
+         FROM   sys.dm_os_ring_buffers 
+         WHERE  ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' 
+                AND record LIKE '%<SystemHealth>%') AS x) AS y 
+ORDER  BY record_id DESC 
+
+-- check if the average CPU utilization was over 50% in the past 10 minutes 
+
+SELECT @AvgCPUUtilization = Avg([sqlserverprocesscpuutilization] 
+                                + [otherprocesscpu utilization]) 
+FROM   #cpuutilization 
+WHERE  eventtime > Dateadd(mm, -10, Getdate()) 
+
+IF @AvgCPUUtilization >= 50 
+  BEGIN 
+      SELECT TOP(10) CONVERT(VARCHAR(25), @AvgCPUUtilization) 
+                     + '%'                                         AS 
+                     [AvgCPUUtilization], 
+                     Getdate() 
+                     [Date and Time] 
+                     , 
+                     r.cpu_time, 
+                     r.total_elapsed_time, 
+                     s.session_id, 
+                     s.login_name, 
+                     s.host_name, 
+                     Db_name(r.database_id)                        AS 
+                     DatabaseName 
+                     , 
+      Substring (t.text, ( r.statement_start_offset / 2 ) + 1, ( 
+      ( CASE 
+          WHEN r.statement_end_offset = -1 THEN 
+          Len(CONVERT(NVARCHAR(max), t.text)) * 
+          2 
+          ELSE r.statement_end_offset 
+        END - r.statement_start_offset ) / 2 ) + 1) AS 
+      [IndividualQuery], 
+      Substring(text, 1, 200)                       AS [ParentQuery], 
+      r.status, 
+      r.start_time, 
+      r.wait_type, 
+      s.program_name 
+      INTO   #possiblecpuutilizationqueries 
+      FROM   sys.dm_exec_sessions s 
+             INNER JOIN sys.dm_exec_connections c 
+                     ON s.session_id = c.session_id 
+             INNER JOIN sys.dm_exec_requests r 
+                     ON c.connection_id = r.connection_id 
+             CROSS apply sys.Dm_exec_sql_text(r.sql_handle) t 
+      WHERE  s.session_id > 50 
+             AND r.session_id != @@spid 
+      ORDER  BY r.cpu_time DESC 
+
+      
+      SELECT * 
+      FROM   #possiblecpuutilizationqueries 
+  END 
+
+-- drop the temp tables 
+IF Object_id('TEMPDB..#CPUUtilization') IS NOT NULL 
+  DROP TABLE #cpuutilization 
+
+IF Object_id('TEMPDB..#PossibleCPUUtilizationQueries') IS NOT NULL 
+  DROP TABLE #possiblecpuutilizationqueries 
+
+
+---------------------------------
+/*** 5.TOP costliest Queries ***/
+---------------------------------
+-- This will give top 20 costliest queries which are executed recently. 
+
+SELECT TOP (20) st.text              AS Query, 
+                qs.execution_count, 
+                qs.total_worker_time AS Total_CPU, 
+                total_CPU_inSeconds = --Converted from microseconds 
+                qs.total_worker_time / 1000000, 
+                average_CPU_inSeconds = --Converted from microseconds 
+                ( qs.total_worker_time / 1000000 ) / qs.execution_count, 
+                qs.total_elapsed_time, 
+                total_elapsed_time_inSeconds = --Converted from microseconds 
+                qs.total_elapsed_time / 1000000, 
+                qp.query_plan 
+FROM   sys.dm_exec_query_stats AS qs 
+       CROSS apply sys.Dm_exec_sql_text(qs.sql_handle) AS st 
+       CROSS apply sys.Dm_exec_query_plan (qs.plan_handle) AS qp 
+ORDER  BY qs.total_worker_time DESC 
+OPTION (recompile); 
+
+
+-------------------------------------------------------------
+/*** 5.TOP costliest Queries with batch and more details ***/
+-------------------------------------------------------------
+
+SELECT TOP 50
+  [Avg. MultiCore/CPU time(sec)] = qs.total_worker_time / 1000000 / qs.execution_count,
+  [Total MultiCore/CPU time(sec)] = qs.total_worker_time / 1000000,
+  [Avg. Elapsed Time(sec)] = qs.total_elapsed_time / 1000000 / qs.execution_count,
+  [Total Elapsed Time(sec)] = qs.total_elapsed_time / 1000000,
+  qs.execution_count,
+  [Avg. I/O] = (total_logical_reads + total_logical_writes) / qs.execution_count,
+  [Total I/O] = total_logical_reads + total_logical_writes,
+  Query = SUBSTRING(qt.[text], (qs.statement_start_offset / 2) + 1,
+  (
+  (
+  CASE qs.statement_end_offset
+    WHEN -1 THEN DATALENGTH(qt.[text])
+    ELSE qs.statement_end_offset
+  END - qs.statement_start_offset
+  ) / 2
+  ) + 1
+  ),
+  Batch = qt.[text],
+  [DB] = DB_NAME(qt.[dbid]),
+  qs.last_execution_time,
+  qp.query_plan
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.[sql_handle]) AS qt
+CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp
+
+ORDER BY [Total MultiCore/CPU time(sec)] DESC;
+
+
+
+/*************************************************
+I got this scripts from SQLskills.com 
+writtern by Paul Randal.
+*************************************************/
+
+--==========================================--
+/*** 1. Monitor IO on databases files from 
+the server starting or Database Online ***/
+--==========================================--
+
+SELECT
+  [ReadLatency] =
+                 CASE
+                   WHEN [num_of_reads] = 0 THEN 0
+                   ELSE ([io_stall_read_ms] / [num_of_reads])
+                 END,
+  [WriteLatency] =
+                  CASE
+                    WHEN [num_of_writes] = 0 THEN 0
+                    ELSE ([io_stall_write_ms] / [num_of_writes])
+                  END,
+  [Latency] =
+             CASE
+               WHEN ([num_of_reads] = 0 AND
+                 [num_of_writes] = 0) THEN 0
+               ELSE ([io_stall] / ([num_of_reads] + [num_of_writes]))
+             END,
+  [AvgBPerRead] =
+                 CASE
+                   WHEN [num_of_reads] = 0 THEN 0
+                   ELSE ([num_of_bytes_read] / [num_of_reads])
+                 END,
+  [AvgBPerWrite] =
+                  CASE
+                    WHEN [num_of_writes] = 0 THEN 0
+                    ELSE ([num_of_bytes_written] / [num_of_writes])
+                  END,
+  [AvgBPerTransfer] =
+                     CASE
+                       WHEN ([num_of_reads] = 0 AND
+                         [num_of_writes] = 0) THEN 0
+                       ELSE (([num_of_bytes_read] + [num_of_bytes_written]) /
+                         ([num_of_reads] + [num_of_writes]))
+                     END,
+  LEFT([mf].[physical_name], 2) AS [Drive],
+  DB_NAME([vfs].[database_id]) AS [DB],
+  [mf].[physical_name]
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS [vfs]
+JOIN sys.master_files AS [mf]
+  ON [vfs].[database_id] = [mf].[database_id]
+  AND [vfs].[file_id] = [mf].[file_id]
+-- WHERE [vfs].[file_id] = 2 -- log files
+-- ORDER BY [Latency] DESC
+-- ORDER BY [ReadLatency] DESC
+ORDER BY [WriteLatency] DESC;
+GO
+
+
+
+--==========================================--
+/*** 2. Monitor IO For particular period ***/
+--==========================================--
+-- In line 41 you can mention the time period
+-- ie; WAITFOR DELAY '00:30:00';
+
+
+IF EXISTS (SELECT
+    *
+  FROM [tempdb].[sys].[objects]
+  WHERE [name] = N'##Stats1')
+  DROP TABLE [##Stats1];
+
+IF EXISTS (SELECT
+    *
+  FROM [tempdb].[sys].[objects]
+  WHERE [name] = N'##Stats2')
+  DROP TABLE [##Stats2];
+GO
+
+SELECT
+  [database_id],
+  [file_id],
+  [num_of_reads],
+  [io_stall_read_ms],
+  [num_of_writes],
+  [io_stall_write_ms],
+  [io_stall],
+  [num_of_bytes_read],
+  [num_of_bytes_written],
+  [file_handle] INTO ##Stats1
+FROM sys.dm_io_virtual_file_stats(NULL, NULL);
+GO
+
+WAITFOR DELAY '00:00:30';
+GO
+
+SELECT
+  [database_id],
+  [file_id],
+  [num_of_reads],
+  [io_stall_read_ms],
+  [num_of_writes],
+  [io_stall_write_ms],
+  [io_stall],
+  [num_of_bytes_read],
+  [num_of_bytes_written],
+  [file_handle] INTO ##Stats2
+FROM sys.dm_io_virtual_file_stats(NULL, NULL);
+GO
+
+WITH [DiffLatencies]
+AS (SELECT
+  -- Files that weren't in the first snapshot
+  [ts2].[database_id],
+  [ts2].[file_id],
+  [ts2].[num_of_reads],
+  [ts2].[io_stall_read_ms],
+  [ts2].[num_of_writes],
+  [ts2].[io_stall_write_ms],
+  [ts2].[io_stall],
+  [ts2].[num_of_bytes_read],
+  [ts2].[num_of_bytes_written]
+FROM [##Stats2] AS [ts2]
+LEFT OUTER JOIN [##Stats1] AS [ts1]
+  ON [ts2].[file_handle] = [ts1].[file_handle]
+WHERE [ts1].[file_handle] IS NULL
+UNION
+SELECT
+  -- Diff of latencies in both snapshots
+  [ts2].[database_id],
+  [ts2].[file_id],
+  [ts2].[num_of_reads] - [ts1].[num_of_reads] AS [num_of_reads],
+  [ts2].[io_stall_read_ms] - [ts1].[io_stall_read_ms] AS [io_stall_read_ms],
+  [ts2].[num_of_writes] - [ts1].[num_of_writes] AS [num_of_writes],
+  [ts2].[io_stall_write_ms] - [ts1].[io_stall_write_ms] AS [io_stall_write_ms],
+  [ts2].[io_stall] - [ts1].[io_stall] AS [io_stall],
+  [ts2].[num_of_bytes_read] - [ts1].[num_of_bytes_read] AS [num_of_bytes_read],
+  [ts2].[num_of_bytes_written] - [ts1].[num_of_bytes_written] AS [num_of_bytes_written]
+FROM [##Stats2] AS [ts2]
+LEFT OUTER JOIN [##Stats1] AS [ts1]
+  ON [ts2].[file_handle] = [ts1].[file_handle]
+WHERE [ts1].[file_handle] IS NOT NULL)
+SELECT
+  DB_NAME([vfs].[database_id]) AS [DB],
+  LEFT([mf].[physical_name], 2) AS [Drive],
+  [mf].[type_desc],
+  [num_of_reads] AS [Reads],
+  [num_of_writes] AS [Writes],
+  [ReadLatency(ms)] =
+                     CASE
+                       WHEN [num_of_reads] = 0 THEN 0
+                       ELSE ([io_stall_read_ms] / [num_of_reads])
+                     END,
+  [WriteLatency(ms)] =
+                      CASE
+                        WHEN [num_of_writes] = 0 THEN 0
+                        ELSE ([io_stall_write_ms] / [num_of_writes])
+                      END,
+  /*[Latency] =
+      CASE WHEN ([num_of_reads] = 0 AND [num_of_writes] = 0)
+          THEN 0 ELSE ([io_stall] / ([num_of_reads] + [num_of_writes])) END,*/
+  [AvgBPerRead] =
+                 CASE
+                   WHEN [num_of_reads] = 0 THEN 0
+                   ELSE ([num_of_bytes_read] / [num_of_reads])
+                 END,
+  [AvgBPerWrite] =
+                  CASE
+                    WHEN [num_of_writes] = 0 THEN 0
+                    ELSE ([num_of_bytes_written] / [num_of_writes])
+                  END,
+  /*[AvgBPerTransfer] =
+      CASE WHEN ([num_of_reads] = 0 AND [num_of_writes] = 0)
+          THEN 0 ELSE
+              (([num_of_bytes_read] + [num_of_bytes_written]) /
+              ([num_of_reads] + [num_of_writes])) END,*/
+  [mf].[physical_name]
+FROM [DiffLatencies] AS [vfs]
+JOIN sys.master_files AS [mf]
+  ON [vfs].[database_id] = [mf].[database_id]
+  AND [vfs].[file_id] = [mf].[file_id]
+-- ORDER BY [ReadLatency(ms)] DESC
+ORDER BY [WriteLatency(ms)] DESC;
+GO
+
+-- Cleanup
+IF EXISTS (SELECT
+    *
+  FROM [tempdb].[sys].[objects]
+  WHERE [name] = N'##Stats1')
+  DROP TABLE [##Stats1];
+
+IF EXISTS (SELECT
+    *
+  FROM [tempdb].[sys].[objects]
+  WHERE [name] = N'##Stats2')
+  DROP TABLE [##Stats2];
+GO
+
+
+--=========================================--
+/*** SQL SERVER MEMORY MONITORING QUERIES ***/
+--=========================================--
+-- Supported Versions SQL server 2008 and higher
+-------------------------------------------------
+
+----------------------------------
+/*** 1. System Memory Status ***/
+----------------------------------
+
+SELECT total_physical_memory_kb / 1024                             AS 
+       [Total Physical Memory], 
+       available_physical_memory_kb / 1024                         AS 
+       [Available Physical Memory], 
+       total_page_file_kb / 1024                                   AS 
+       [Total Page File (MB)], 
+       available_page_file_kb / 1024                               AS 
+       [Available Page File (MB)], 
+       100 - ( 100 * Cast(available_physical_memory_kb AS DECIMAL(18, 3)) / Cast 
+               ( 
+                     total_physical_memory_kb AS DECIMAL(18, 3)) ) AS 
+       'Percentage Used', 
+       system_memory_state_desc                                    AS 
+       [Memory State] 
+FROM   sys.dm_os_sys_memory; 
+
+
+---------------------------------------
+/*** 2. SQL Server's memory Status ***/
+---------------------------------------
+-- this will show how much memory allocated to SQL Server , Buffer pool commit.
+
+-- SQL server 2008 and earlier
+
+SELECT
+     (bpool_committed*8)/1024.0 as [Buffer Pool Committed (MB)],
+     (bpool_commit_target*8)/1024.0 as [Buffer Pool Committed Targer (MB)]  
+FROM sys.dm_os_sys_info;
+
+-- SQL Server 2012 and later
+
+SELECT
+      (committed_kb)/1024.0 as [Buffer Pool Committed (MB)],
+      (committed_target_kb)/1024.0 as [Buffer Pool Committed Targer (MB)] 
+FROM  sys.dm_os_sys_info;
+
+
+----------------------------------------------
+/*** 3. Physical Memory Used By SQL Sever***/
+----------------------------------------------
+-- Find the actual Memory used by SQL Server
+
+select
+      convert(decimal (5,2),physical_memory_in_use_kb/1048576.0) AS 'Physical Memory Used By SQL (GB)',
+      convert(decimal (5,2),locked_page_allocations_kb/1048576.0) As 'Locked Page Allocation',
+       convert(decimal (5,2),available_commit_limit_kb/1048576.0) AS 'Available Commit Limit (GB)',
+      page_fault_count as 'Page Fault Count'
+from  sys.dm_os_process_memory;
+
+------------------------------------------
+/*** 4. Buffer Pool Usage By Databases ***/
+------------------------------------------
+
+DECLARE @total_buffer INT;
+SELECT  @total_buffer = cntr_value 
+FROM   sys.dm_os_performance_counters
+WHERE  RTRIM([object_name]) LIKE '%Buffer Manager' 
+       AND counter_name = 'Database Pages';
+ 
+;WITH DBBuffer AS
+(
+SELECT  database_id,
+        COUNT_BIG(*) AS db_buffer_pages,
+        SUM (CAST ([free_space_in_bytes] AS BIGINT)) / (1024 * 1024) AS [MBEmpty]
+FROM    sys.dm_os_buffer_descriptors
+GROUP BY database_id
+)
+SELECT
+       CASE [database_id] WHEN 32767 THEN 'Resource DB' ELSE DB_NAME([database_id]) END AS 'DataBase Name',
+       db_buffer_pages AS 'DB Buffer Pages',
+       db_buffer_pages / 128 AS 'DB Buffer Pages Used (MB)',
+       [mbempty] AS 'DB Buffer Pages Free (MB)',
+       CONVERT(DECIMAL(6,3), db_buffer_pages * 100.0 / @total_buffer) AS 'DB Buffer Percentage'
+FROM   DBBuffer
+ORDER BY [DB Buffer Pages Used (MB)] DESC;
+
+
+--------------------------------------------
+/*** 5. Memory Used By Database Objects ***/
+--------------------------------------------
+
+;WITH obj_buffer 
+     AS (SELECT [Object] = o.NAME, 
+                [Type] = o.type_desc, 
+                [Index] = COALESCE(i.NAME, ''), 
+                [Index_Type] = i.type_desc, 
+                p.[object_id], 
+                p.index_id, 
+                au.allocation_unit_id 
+         FROM   sys.partitions AS p 
+                INNER JOIN sys.allocation_units AS au 
+                        ON p.hobt_id = au.container_id 
+                INNER JOIN sys.objects AS o 
+                        ON p.[object_id] = o.[object_id] 
+                INNER JOIN sys.indexes AS i 
+                        ON o.[object_id] = i.[object_id] 
+                           AND p.index_id = i.index_id 
+         WHERE  au.[type] IN ( 1, 2, 3 ) 
+                AND o.is_ms_shipped = 0) 
+SELECT obj.[object], 
+       obj.[type], 
+       obj.[index], 
+       obj.index_type, 
+       Count_big(b.page_id)       AS 'Buffer Pages', 
+       Count_big(b.page_id) / 128 AS 'Buffer MB' 
+FROM   obj_buffer obj 
+       INNER JOIN sys.dm_os_buffer_descriptors AS b 
+               ON obj.allocation_unit_id = b.allocation_unit_id 
+WHERE  b.database_id = Db_id() 
+GROUP  BY obj.[object], 
+          obj.[type], 
+          obj.[index], 
+          obj.index_type 
+ORDER  BY [buffer pages] DESC; 
+
+
+----------------------------------------
+/*** 6. Costliest Stored Procedures ***/
+----------------------------------------
+-- Based on Logical reads
+
+SELECT TOP(25) p.NAME                                      AS [SP Name], 
+               qs.total_logical_reads                      AS 
+               [TotalLogicalReads], 
+               qs.total_logical_reads / qs.execution_count AS [AvgLogicalReads], 
+               qs.execution_count                          AS 'execution_count', 
+               qs.total_elapsed_time                       AS 
+               'total_elapsed_time', 
+               qs.total_elapsed_time / qs.execution_count  AS 'avg_elapsed_time' 
+               , 
+               qs.cached_time                              AS 
+               'cached_time' 
+FROM   sys.procedures AS p 
+       INNER JOIN sys.dm_exec_procedure_stats AS qs 
+               ON p.[object_id] = qs.[object_id] 
+WHERE  qs.database_id = Db_id() 
+ORDER  BY qs.total_logical_reads DESC; 
+
+
+----------------------------------------------
+/*** 7. Top Performance Counters – Memory ***/
+----------------------------------------------
+
+-- Get size of SQL Server Page in bytes 
+DECLARE @pg_size      INT, 
+        @Instancename VARCHAR(50) 
+
+SELECT @pg_size = low 
+FROM   master..spt_values 
+WHERE  number = 1 
+       AND type = 'E' 
+
+-- Extract perfmon counters to a temporary table 
+IF Object_id('tempdb..#perfmon_counters') IS NOT NULL 
+  DROP TABLE #perfmon_counters 
+
+SELECT * 
+INTO   #perfmon_counters 
+FROM   sys.dm_os_performance_counters; 
+
+-- Get SQL Server instance name as it require for capturing Buffer Cache hit Ratio 
+SELECT @Instancename = LEFT([object_name], ( Charindex(':', [object_name]) )) 
+FROM   #perfmon_counters 
+WHERE  counter_name = 'Buffer cache hit ratio'; 
+
+SELECT * 
+FROM   (SELECT 'Total Server Memory (GB)' AS Counter, 
+               ( cntr_value / 1048576.0 ) AS Value 
+        FROM   #perfmon_counters 
+        WHERE  counter_name = 'Total Server Memory (KB)' 
+        UNION ALL 
+        SELECT 'Target Server Memory (GB)', 
+               ( cntr_value / 1048576.0 ) 
+        FROM   #perfmon_counters 
+        WHERE  counter_name = 'Target Server Memory (KB)' 
+        UNION ALL 
+        SELECT 'Connection Memory (MB)', 
+               ( cntr_value / 1024.0 ) 
+        FROM   #perfmon_counters 
+        WHERE  counter_name = 'Connection Memory (KB)' 
+        UNION ALL 
+        SELECT 'Lock Memory (MB)', 
+               ( cntr_value / 1024.0 ) 
+        FROM   #perfmon_counters 
+        WHERE  counter_name = 'Lock Memory (KB)' 
+        UNION ALL 
+        SELECT 'SQL Cache Memory (MB)', 
+               ( cntr_value / 1024.0 ) 
+        FROM   #perfmon_counters 
+        WHERE  counter_name = 'SQL Cache Memory (KB)' 
+        UNION ALL 
+        SELECT 'Optimizer Memory (MB)', 
+               ( cntr_value / 1024.0 ) 
+        FROM   #perfmon_counters 
+        WHERE  counter_name = 'Optimizer Memory (KB) ' 
+        UNION ALL 
+        SELECT 'Granted Workspace Memory (MB)', 
+               ( cntr_value / 1024.0 ) 
+        FROM   #perfmon_counters 
+        WHERE  counter_name = 'Granted Workspace Memory (KB) ' 
+        UNION ALL 
+        SELECT 'Cursor memory usage (MB)', 
+               ( cntr_value / 1024.0 ) 
+        FROM   #perfmon_counters 
+        WHERE  counter_name = 'Cursor memory usage' 
+               AND instance_name = '_Total' 
+        UNION ALL 
+        SELECT 'Total pages Size (MB)', 
+               ( cntr_value * @pg_size ) / 1048576.0 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Buffer Manager' 
+               AND counter_name = 'Total pages' 
+        UNION ALL 
+        SELECT 'Database pages (MB)', 
+               ( cntr_value * @pg_size ) / 1048576.0 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Buffer Manager' 
+               AND counter_name = 'Database pages' 
+        UNION ALL 
+        SELECT 'Free pages (MB)', 
+               ( cntr_value * @pg_size ) / 1048576.0 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Buffer Manager' 
+               AND counter_name = 'Free pages' 
+        UNION ALL 
+        SELECT 'Reserved pages (MB)', 
+               ( cntr_value * @pg_size ) / 1048576.0 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Buffer Manager' 
+               AND counter_name = 'Reserved pages' 
+        UNION ALL 
+        SELECT 'Stolen pages (MB)', 
+               ( cntr_value * @pg_size ) / 1048576.0 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Buffer Manager' 
+               AND counter_name = 'Stolen pages' 
+        UNION ALL 
+        SELECT 'Cache Pages (MB)', 
+               ( cntr_value * @pg_size ) / 1048576.0 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Plan Cache' 
+               AND counter_name = 'Cache Pages' 
+               AND instance_name = '_Total' 
+        UNION ALL 
+        SELECT 'Page Life Expectency in seconds', 
+               cntr_value 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Buffer Manager' 
+               AND counter_name = 'Page life expectancy' 
+        UNION ALL 
+        SELECT 'Free list stalls/sec', 
+               cntr_value 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Buffer Manager' 
+               AND counter_name = 'Free list stalls/sec' 
+        UNION ALL 
+        SELECT 'Checkpoint pages/sec', 
+               cntr_value 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Buffer Manager' 
+               AND counter_name = 'Checkpoint pages/sec' 
+        UNION ALL 
+        SELECT 'Lazy writes/sec', 
+               cntr_value 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Buffer Manager' 
+               AND counter_name = 'Lazy writes/sec' 
+        UNION ALL 
+        SELECT 'Memory Grants Pending', 
+               cntr_value 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Memory Manager' 
+               AND counter_name = 'Memory Grants Pending' 
+        UNION ALL 
+        SELECT 'Memory Grants Outstanding', 
+               cntr_value 
+        FROM   #perfmon_counters 
+        WHERE  object_name = @Instancename + 'Memory Manager' 
+               AND counter_name = 'Memory Grants Outstanding' 
+        UNION ALL 
+        SELECT 'process_physical_memory_low', 
+               process_physical_memory_low 
+        FROM   sys.dm_os_process_memory WITH (nolock) 
+        UNION ALL 
+        SELECT 'process_virtual_memory_low', 
+               process_virtual_memory_low 
+        FROM   sys.dm_os_process_memory WITH (nolock) 
+        UNION ALL 
+        SELECT 'Max_Server_Memory (MB)', 
+               [value_in_use] 
+        FROM   sys.configurations 
+        WHERE  [name] = 'max server memory (MB)' 
+        UNION ALL 
+        SELECT 'Min_Server_Memory (MB)', 
+               [value_in_use] 
+        FROM   sys.configurations 
+        WHERE  [name] = 'min server memory (MB)' 
+        UNION ALL 
+        SELECT 'BufferCacheHitRatio', 
+               ( a.cntr_value * 1.0 / b.cntr_value ) * 100.0 
+        FROM   sys.dm_os_performance_counters a 
+               JOIN (SELECT cntr_value, 
+                            object_name 
+                     FROM   sys.dm_os_performance_counters 
+                     WHERE  counter_name = 'Buffer cache hit ratio base' 
+                            AND object_name = @Instancename + 'Buffer Manager') 
+                    b 
+                 ON a.object_name = b.object_name 
+        WHERE  a.counter_name = 'Buffer cache hit ratio' 
+               AND a.object_name = @Instancename + 'Buffer Manager') AS D; 
+
+
+
+			   /********************************************************************************************
+***  Blocking and deadlock monitor ***
+------------------------------------------------
+I have prepared this script to monitor blocking  sessions with sp_whoisactive,
+So first you need tocreate sp_whoisactive stored procedure, 
+please downad it from the link,
+https://github.com/SqlAdmin/AwesomeSQLServer/blob/master/T-SQL%20Scripts/sp_whoisactive.sql
+*******************************************************************************************/ 
+
+
+-- To get overall info about current sessions
+
+EXEC sp_whoisactive
+---------------------------------------
+/*** 1. Monitor blocking session ***/
+---------------------------------------
+
+EXEC sp_WhoIsActive @find_block_leaders = 1,
+                    @output_column_list = '[dd%][session_id][database_name][login_name] [sql_text][wait_info][blocking_session_id][blocked_session_count]',
+                    @sort_order = '[start_time] ASC';
+
+
+---------------------------------------
+/*** 2. Monitor deadlocking session ***/
+---------------------------------------
+
+WITH [Blocking]
+AS (SELECT
+  w.[session_id],
+  s.[original_login_name],
+  s.[login_name],
+  w.[wait_duration_ms],
+  w.[wait_type],
+  r.[status],
+  r.[wait_resource],
+  w.[resource_description],
+  s.[program_name],
+  w.[blocking_session_id],
+  s.[host_name],
+  r.[command],
+  r.[percent_complete],
+  r.[cpu_time],
+  r.[total_elapsed_time],
+  r.[reads],
+  r.[writes],
+  r.[logical_reads],
+  r.[row_count],
+  q.[text],
+  q.[dbid],
+  p.[query_plan],
+  r.[plan_handle]
+FROM [sys].[dm_os_waiting_tasks] w
+INNER JOIN [sys].[dm_exec_sessions] s
+  ON w.[session_id] = s.[session_id]
+INNER JOIN [sys].[dm_exec_requests] r
+  ON s.[session_id] = r.[session_id]
+CROSS APPLY [sys].[dm_exec_sql_text](r.[plan_handle]) q
+CROSS APPLY [sys].[dm_exec_query_plan](r.[plan_handle]) p
+WHERE w.[session_id] > 50
+AND w.[wait_type] NOT IN ('DBMIRROR_DBM_EVENT'
+, 'ASYNC_NETWORK_IO'))
+SELECT
+  b.[session_id] AS [WaitingSessionID],
+  b.[blocking_session_id] AS [BlockingSessionID],
+  b.[login_name] AS [WaitingUserSessionLogin],
+  s1.[login_name] AS [BlockingUserSessionLogin],
+  b.[original_login_name] AS [WaitingUserConnectionLogin],
+  s1.[original_login_name] AS [BlockingSessionConnectionLogin],
+  b.[wait_duration_ms] AS [WaitDuration],
+  b.[wait_type] AS [WaitType],
+  t.[request_mode] AS [WaitRequestMode],
+  UPPER(b.[status]) AS [WaitingProcessStatus],
+  UPPER(s1.[status]) AS [BlockingSessionStatus],
+  b.[wait_resource] AS [WaitResource],
+  t.[resource_type] AS [WaitResourceType],
+  t.[resource_database_id] AS [WaitResourceDatabaseID],
+  DB_NAME(t.[resource_database_id]) AS [WaitResourceDatabaseName],
+  b.[resource_description] AS [WaitResourceDescription],
+  b.[program_name] AS [WaitingSessionProgramName],
+  s1.[program_name] AS [BlockingSessionProgramName],
+  b.[host_name] AS [WaitingHost],
+  s1.[host_name] AS [BlockingHost],
+  b.[command] AS [WaitingCommandType],
+  b.[text] AS [WaitingCommandText],
+  b.[row_count] AS [WaitingCommandRowCount],
+  b.[percent_complete] AS [WaitingCommandPercentComplete],
+  b.[cpu_time] AS [WaitingCommandCPUTime],
+  b.[total_elapsed_time] AS [WaitingCommandTotalElapsedTime],
+  b.[reads] AS [WaitingCommandReads],
+  b.[writes] AS [WaitingCommandWrites],
+  b.[logical_reads] AS [WaitingCommandLogicalReads],
+  b.[query_plan] AS [WaitingCommandQueryPlan],
+  b.[plan_handle] AS [WaitingCommandPlanHandle]
+FROM [Blocking] b
+INNER JOIN [sys].[dm_exec_sessions] s1
+  ON b.[blocking_session_id] = s1.[session_id]
+INNER JOIN [sys].[dm_tran_locks] t
+  ON t.[request_session_id] = b.[session_id]
+WHERE t.[request_status] = 'WAIT'
+GO     
+
+
+--==============================================--
+/*** SQL SERVER Disk Space Monitoring QUERIES ***/
+--==============================================--
+
+-- Supported Versions SQL server 2008 and higher
+-------------------------------------------------
+
+----------------------------------------------
+/*** 1. Get all Disks Total and Free Size ***/
+----------------------------------------------
+
+
+DECLARE @MOUNTVOL TABLE
+ ( MOUNTVOLResult nVARCHAR(500)
+  ,ExecCommand nVARCHAR(500))
+  
+INSERT INTO @MOUNTVOL (MOUNTVOLResult) 
+EXEC XP_CMDSHELL 'MOUNTVOL'
+  
+DELETE @MOUNTVOL WHERE MOUNTVOLResult LIKE '%VOLUME%'
+DELETE @MOUNTVOL WHERE MOUNTVOLResult IS NULL
+DELETE @MOUNTVOL WHERE MOUNTVOLResult NOT LIKE '%:%'
+DELETE @MOUNTVOL WHERE MOUNTVOLResult LIKE '%MOUNTVOL%'
+DELETE @MOUNTVOL WHERE MOUNTVOLResult LIKE '%RECYCLE%'
+  
+UPDATE @MOUNTVOL SET ExecCommand = 'EXEC XP_CMDSHELL ''FSUTIL VOLUME DISKFREE ' + LTRIM(RTRIM(MOUNTVOLResult)) +''''
+  
+DECLARE @DRIVESpace TABLE
+ ( DriveLetter VARCHAR(10)
+  ,DriveInfo VARCHAR(100))
+    
+WHILE (SELECT COUNT(*) FROM @MOUNTVOL) <>0
+BEGIN
+ DECLARE @Command nVARCHAR(500), @DriveLetter nVARCHAR(10)
+ Select @Command = ExecCommand, @DriveLetter= MOUNTVOLResult from @MOUNTVOL
+ INSERT INTO @DRIVESpace (DriveInfo) Exec sp_executeSQL @Command
+ UPDATE @DRIVESpace SET DriveLetter=@DriveLetter WHERE DriveLetter IS NULL
+ DELETE FROM @MOUNTVOL WHERE ExecCommand=@Command
+END
+  
+DECLARE @FinalResults TABLE
+ ( DriveLetter nVARCHAR(10)
+  ,[TotalDriveSpace(MB)] DECIMAL(18,2)
+  ,[UsedSpaceOnDrive(MB)] AS ([TotalDriveSpace(MB)] - [FreeSpaceOnDrive(MB)])
+  ,[FreeSpaceOnDrive(MB)] DECIMAL(18,2)
+  ,[TotalDriveSpace(GB)] AS CAST(([TotalDriveSpace(MB)]/1024) AS DECIMAL(18,2))
+  ,[UsedSpaceOnDrive(GB)] AS CAST((([TotalDriveSpace(MB)] - [FreeSpaceOnDrive(MB)])/1024) AS DECIMAL(18,2))
+  ,[FreeSpaceOnDrive(GB)] AS CAST(([FreeSpaceOnDrive(MB)]/1024) AS DECIMAL(18,2))
+  ,[%FreeSpace] AS CAST((([FreeSpaceOnDrive(MB)]/[TotalDriveSpace(MB)])*100) AS DECIMAL(18,2)))
+  
+INSERT INTO @FinalResults (DriveLetter, [TotalDriveSpace(MB)],[FreeSpaceOnDrive(MB)])
+SELECT RTRIM(LTRIM(DriveLetter))
+    ,[TotalDriveSpace(MB)] = SUM(CASE WHEN DriveInfo LIKE 'TOTAL # OF BYTES%' THEN CAST(SUBSTRING(DriveInfo, 32, 48) AS FLOAT) ELSE CAST(0 AS FLOAT) END)/1024/1024
+    ,[FreeSpaceOnDrive(MB)] = SUM(CASE WHEN DriveInfo LIKE 'TOTAL # OF FREE BYTES%' THEN CAST(SUBSTRING(DriveInfo, 32, 48) AS FLOAT) ELSE CAST(0 AS FLOAT) END)/1024/1024
+FROM @DRIVESpace
+WHERE DriveInfo LIKE 'TOTAL # OF %'
+GROUP BY DriveLetter
+ORDER BY DriveLetter
+  
+SELECT DriveLetter, [TotalDriveSpace(GB)], [TotalDriveSpace(GB)], [%FreeSpace] FROM @FinalResults
+
+
+-------------------------------------------------
+/*** 2. Get databases physical file location ***/
+-------------------------------------------------
+
+SELECT DISTINCT Db_name(dovs.database_id) 
+                [Database Name], 
+                mf.physical_name 
+                [Physical File Location], 
+                dovs.logical_volume_name                              AS 
+                [Logical Name], 
+                dovs.volume_mount_point                               AS Drive, 
+                CONVERT(INT, dovs.available_bytes / 1048576.0 / 1024) AS 
+                [Free Space (GB)] 
+FROM   sys.master_files mf 
+       CROSS apply sys.Dm_os_volume_stats(mf.database_id, mf.file_id) dovs 
+ORDER  BY [free space (gb)] ASC 
+
+
+----------------------------------------------
+/*** 3. List all Databases and its file size ***/
+----------------------------------------------
+
+--Data file size
+DECLARE @dbsize TABLE (
+  Dbname sysname,
+  dbstatus varchar(50),
+  Recovery_Model varchar(40) DEFAULT ('NA'),
+  file_Size_MB decimal(30, 2) DEFAULT (0),
+  Space_Used_MB decimal(30, 2) DEFAULT (0),
+  Free_Space_MB decimal(30, 2) DEFAULT (0)
+)
+
+INSERT INTO @dbsize (Dbname, dbstatus, Recovery_Model, file_Size_MB, Space_Used_MB, Free_Space_MB)
+EXEC sp_msforeachdb 'use [?]; 
+  select DB_NAME() AS DbName, 
+    CONVERT(varchar(20),DatabasePropertyEx(''?'',''Status'')) ,  
+    CONVERT(varchar(20),DatabasePropertyEx(''?'',''Recovery'')),  
+sum(size)/128.0 AS File_Size_MB, 
+sum(CAST(FILEPROPERTY(name, ''SpaceUsed'') AS INT))/128.0 as Space_Used_MB, 
+SUM( size)/128.0 - sum(CAST(FILEPROPERTY(name,''SpaceUsed'') AS INT))/128.0 AS Free_Space_MB  
+from sys.database_files  where type=0 group by type'
+
+
+-- log file size
+DECLARE @logsize TABLE (
+  Dbname sysname,
+  Log_File_Size_MB decimal(38, 2) DEFAULT (0),
+  log_Space_Used_MB decimal(30, 2) DEFAULT (0),
+  log_Free_Space_MB decimal(30, 2) DEFAULT (0)
+)
+
+INSERT INTO @logsize (Dbname, Log_File_Size_MB, log_Space_Used_MB, log_Free_Space_MB)
+EXEC sp_msforeachdb 'use [?]; 
+  select DB_NAME() AS DbName, 
+sum(size)/128.0 AS Log_File_Size_MB, 
+sum(CAST(FILEPROPERTY(name, ''SpaceUsed'') AS INT))/128.0 as log_Space_Used_MB, 
+SUM( size)/128.0 - sum(CAST(FILEPROPERTY(name,''SpaceUsed'') AS INT))/128.0 AS log_Free_Space_MB  
+from sys.database_files  where type=1 group by type'
+
+-- database free size 
+DECLARE @dbfreesize TABLE (
+  name sysname,
+  database_size varchar(50),
+  Freespace varchar(50) DEFAULT (0.00)
+)
+INSERT INTO @dbfreesize (name, database_size, Freespace)
+EXEC sp_msforeachdb 'use [?];SELECT database_name = db_name() 
+    ,database_size = ltrim(str((convert(DECIMAL(15, 2), dbsize) + convert(DECIMAL(15, 2), logsize)) * 8192 / 1048576, 15, 2) + ''MB'') 
+    ,''unallocated space'' = ltrim(str(( 
+                CASE  
+                    WHEN dbsize >= reservedpages 
+                        THEN (convert(DECIMAL(15, 2), dbsize) - convert(DECIMAL(15, 2), reservedpages)) * 8192 / 1048576 
+                    ELSE 0 
+                    END 
+                ), 15, 2) + '' MB'') 
+FROM ( 
+    SELECT dbsize = sum(convert(BIGINT, CASE  
+                    WHEN type = 0 
+                        THEN size 
+                    ELSE 0 
+                    END)) 
+        ,logsize = sum(convert(BIGINT, CASE  
+                    WHEN type <> 0 
+                        THEN size 
+                    ELSE 0 
+                    END)) 
+    FROM sys.database_files 
+) AS files 
+,( 
+    SELECT reservedpages = sum(a.total_pages) 
+        ,usedpages = sum(a.used_pages) 
+        ,pages = sum(CASE  
+                WHEN it.internal_type IN ( 
+                        202 
+                        ,204 
+                        ,211 
+                        ,212 
+                        ,213 
+                        ,214 
+                        ,215 
+                        ,216 
+                        ) 
+                    THEN 0 
+                WHEN a.type <> 1 
+                    THEN a.used_pages 
+                WHEN p.index_id < 2 
+                    THEN a.data_pages 
+                ELSE 0 
+                END) 
+    FROM sys.partitions p 
+    INNER JOIN sys.allocation_units a 
+        ON p.partition_id = a.container_id 
+    LEFT JOIN sys.internal_tables it 
+        ON p.object_id = it.object_id 
+) AS partitions'
+
+
+DECLARE @alldbstate TABLE (
+
+  dbname sysname,
+  DBstatus varchar(55),
+  R_model varchar(30)
+)
+
+--select * from sys.master_files 
+
+INSERT INTO @alldbstate (dbname, DBstatus, R_model)
+  SELECT
+    name,
+    CONVERT(varchar(20), DATABASEPROPERTYEX(name, 'status')),
+    recovery_model_desc
+  FROM sys.databases
+--select * from @dbsize 
+
+INSERT INTO @dbsize (Dbname, dbstatus, Recovery_Model)
+  SELECT
+    dbname,
+    dbstatus,
+    R_model
+  FROM @alldbstate
+  WHERE DBstatus <> 'online'
+
+INSERT INTO @logsize (Dbname)
+  SELECT
+    dbname
+  FROM @alldbstate
+  WHERE DBstatus <> 'online'
+
+INSERT INTO @dbfreesize (name)
+  SELECT
+    dbname
+  FROM @alldbstate
+  WHERE DBstatus <> 'online'
+
+SELECT
+
+  d.Dbname AS [Database Name],
+  d.dbstatus AS [Status],
+  d.Recovery_Model AS [Recovery Mode],
+  (file_size_mb + log_file_size_mb) AS [Total DB Size],
+  fs.Freespace AS [DB Free Space],
+  d.file_Size_MB AS [MDF Size(MB)],
+  d.Space_Used_MB AS [MDF Used(MB)],
+  d.Free_Space_MB AS [MDF Free(MB)],
+  l.Log_File_Size_MB AS [LDF Size (MB)],
+  log_Space_Used_MB AS [LDF Used (MB)],
+  l.log_Free_Space_MB AS [LDF Free (MB)]
+FROM @dbsize d
+JOIN @logsize l
+  ON d.Dbname = l.Dbname
+JOIN @dbfreesize fs
+  ON d.Dbname = fs.name
+ORDER BY [Database Name] ASC
+
+
+
+/**********************************************
+          Monitoring Wait stats
+***********************************************/
+
+--========================================--
+/*** 1. Monitor Current sessions wait ***/
+--========================================--
+
+
+SELECT
+  dm_ws.wait_duration_ms,
+  dm_ws.wait_type,
+  dm_es.status,
+  dm_t.TEXT,
+  dm_qp.query_plan,
+  dm_ws.session_ID,
+  dm_es.cpu_time,
+  dm_es.memory_usage,
+  dm_es.logical_reads,
+  dm_es.total_elapsed_time,
+  dm_es.program_name,
+  DB_NAME(dm_r.database_id) DatabaseName,
+  -- Optional columns
+  dm_ws.blocking_session_id,
+  dm_r.wait_resource,
+  dm_es.login_name,
+  dm_r.command,
+  dm_r.last_wait_type
+FROM sys.dm_os_waiting_tasks dm_ws
+INNER JOIN sys.dm_exec_requests dm_r
+  ON dm_ws.session_id = dm_r.session_id
+INNER JOIN sys.dm_exec_sessions dm_es
+  ON dm_es.session_id = dm_r.session_id
+CROSS APPLY sys.dm_exec_sql_text(dm_r.sql_handle) dm_t
+CROSS APPLY sys.dm_exec_query_plan(dm_r.plan_handle) dm_qp
+WHERE dm_es.is_user_process = 1
+GO
+
+--===========================================--
+/*** 2. Monior waits for a specific period ***/
+--===========================================--
+
+-- Got this from SQLskills.com
+-- You can set the time limit in > WAITFOR DELAY '00:30:00';
+
+IF EXISTS (SELECT
+    *
+  FROM [tempdb].[sys].[objects]
+  WHERE [name] = N'##SQLskillsStats1')
+  DROP TABLE [##SQLskillsStats1];
+
+IF EXISTS (SELECT
+    *
+  FROM [tempdb].[sys].[objects]
+  WHERE [name] = N'##SQLskillsStats2')
+  DROP TABLE [##SQLskillsStats2];
+GO
+
+SELECT
+  [wait_type],
+  [waiting_tasks_count],
+  [wait_time_ms],
+  [max_wait_time_ms],
+  [signal_wait_time_ms] INTO ##SQLskillsStats1
+FROM sys.dm_os_wait_stats;
+GO
+
+WAITFOR DELAY '00:30:00';
+GO
+
+SELECT
+  [wait_type],
+  [waiting_tasks_count],
+  [wait_time_ms],
+  [max_wait_time_ms],
+  [signal_wait_time_ms] INTO ##SQLskillsStats2
+FROM sys.dm_os_wait_stats;
+GO
+
+WITH [DiffWaits]
+AS (SELECT
+  -- Waits that weren't in the first snapshot
+  [ts2].[wait_type],
+  [ts2].[wait_time_ms],
+  [ts2].[signal_wait_time_ms],
+  [ts2].[waiting_tasks_count]
+FROM [##SQLskillsStats2] AS [ts2]
+LEFT OUTER JOIN [##SQLskillsStats1] AS [ts1]
+  ON [ts2].[wait_type] = [ts1].[wait_type]
+WHERE [ts1].[wait_type] IS NULL
+AND [ts2].[wait_time_ms] > 0
+UNION
+SELECT
+  -- Diff of waits in both snapshots
+  [ts2].[wait_type],
+  [ts2].[wait_time_ms] - [ts1].[wait_time_ms] AS [wait_time_ms],
+  [ts2].[signal_wait_time_ms] - [ts1].[signal_wait_time_ms] AS [signal_wait_time_ms],
+  [ts2].[waiting_tasks_count] - [ts1].[waiting_tasks_count] AS [waiting_tasks_count]
+FROM [##SQLskillsStats2] AS [ts2]
+LEFT OUTER JOIN [##SQLskillsStats1] AS [ts1]
+  ON [ts2].[wait_type] = [ts1].[wait_type]
+WHERE [ts1].[wait_type] IS NOT NULL
+AND [ts2].[waiting_tasks_count] - [ts1].[waiting_tasks_count] > 0
+AND [ts2].[wait_time_ms] - [ts1].[wait_time_ms] > 0),
+[Waits]
+AS (SELECT
+  [wait_type],
+  [wait_time_ms] / 1000.0 AS [WaitS],
+  ([wait_time_ms] - [signal_wait_time_ms]) / 1000.0 AS [ResourceS],
+  [signal_wait_time_ms] / 1000.0 AS [SignalS],
+  [waiting_tasks_count] AS [WaitCount],
+  100.0 * [wait_time_ms] / SUM([wait_time_ms]) OVER () AS [Percentage],
+  ROW_NUMBER() OVER (ORDER BY [wait_time_ms] DESC) AS [RowNum]
+FROM [DiffWaits]
+WHERE [wait_type] NOT IN (
+N'BROKER_EVENTHANDLER', N'BROKER_RECEIVE_WAITFOR',
+N'BROKER_TASK_STOP', N'BROKER_TO_FLUSH',
+N'BROKER_TRANSMITTER', N'CHECKPOINT_QUEUE',
+N'CHKPT', N'CLR_AUTO_EVENT',
+N'CLR_MANUAL_EVENT', N'CLR_SEMAPHORE',
+N'DBMIRROR_DBM_EVENT', N'DBMIRROR_EVENTS_QUEUE',
+N'DBMIRROR_WORKER_QUEUE', N'DBMIRRORING_CMD',
+N'DIRTY_PAGE_POLL', N'DISPATCHER_QUEUE_SEMAPHORE',
+N'EXECSYNC', N'FSAGENT',
+N'FT_IFTS_SCHEDULER_IDLE_WAIT', N'FT_IFTSHC_MUTEX',
+N'HADR_CLUSAPI_CALL', N'HADR_FILESTREAM_IOMGR_IOCOMPLETION',
+N'HADR_LOGCAPTURE_WAIT', N'HADR_NOTIFICATION_DEQUEUE',
+N'HADR_TIMER_TASK', N'HADR_WORK_QUEUE',
+N'KSOURCE_WAKEUP', N'LAZYWRITER_SLEEP',
+N'LOGMGR_QUEUE', N'ONDEMAND_TASK_QUEUE',
+N'PWAIT_ALL_COMPONENTS_INITIALIZED',
+N'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP',
+N'QDS_SHUTDOWN_QUEUE',
+N'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP',
+N'REQUEST_FOR_DEADLOCK_SEARCH', N'RESOURCE_QUEUE',
+N'SERVER_IDLE_CHECK', N'SLEEP_BPOOL_FLUSH',
+N'SLEEP_DBSTARTUP', N'SLEEP_DCOMSTARTUP',
+N'SLEEP_MASTERDBREADY', N'SLEEP_MASTERMDREADY',
+N'SLEEP_MASTERUPGRADED', N'SLEEP_MSDBSTARTUP',
+N'SLEEP_SYSTEMTASK', N'SLEEP_TASK',
+N'SLEEP_TEMPDBSTARTUP', N'SNI_HTTP_ACCEPT',
+N'SP_SERVER_DIAGNOSTICS_SLEEP', N'SQLTRACE_BUFFER_FLUSH',
+N'SQLTRACE_INCREMENTAL_FLUSH_SLEEP',
+N'SQLTRACE_WAIT_ENTRIES', N'WAIT_FOR_RESULTS',
+N'WAITFOR', N'WAITFOR_TASKSHUTDOWN',
+N'WAIT_XTP_HOST_WAIT', N'WAIT_XTP_OFFLINE_CKPT_NEW_LOG',
+N'WAIT_XTP_CKPT_CLOSE', N'XE_DISPATCHER_JOIN',
+N'XE_DISPATCHER_WAIT', N'XE_TIMER_EVENT'))
+SELECT
+  [W1].[wait_type] AS [WaitType],
+  CAST([W1].[WaitS] AS decimal(16, 2)) AS [Wait_S],
+  CAST([W1].[ResourceS] AS decimal(16, 2)) AS [Resource_S],
+  CAST([W1].[SignalS] AS decimal(16, 2)) AS [Signal_S],
+  [W1].[WaitCount] AS [WaitCount],
+  CAST([W1].[Percentage] AS decimal(5, 2)) AS [Percentage],
+  CAST(([W1].[WaitS] / [W1].[WaitCount]) AS decimal(16, 4)) AS [AvgWait_S],
+  CAST(([W1].[ResourceS] / [W1].[WaitCount]) AS decimal(16, 4)) AS [AvgRes_S],
+  CAST(([W1].[SignalS] / [W1].[WaitCount]) AS decimal(16, 4)) AS [AvgSig_S]
+FROM [Waits] AS [W1]
+INNER JOIN [Waits] AS [W2]
+  ON [W2].[RowNum] <= [W1].[RowNum]
+GROUP BY [W1].[RowNum],
+         [W1].[wait_type],
+         [W1].[WaitS],
+         [W1].[ResourceS],
+         [W1].[SignalS],
+         [W1].[WaitCount],
+         [W1].[Percentage]
+HAVING SUM([W2].[Percentage]) - [W1].[Percentage] < 95; -- percentage threshold
+GO
+
+-- Cleanup
+IF EXISTS (SELECT
+    *
+  FROM [tempdb].[sys].[objects]
+  WHERE [name] = N'##SQLskillsStats1')
+  DROP TABLE [##SQLskillsStats1];
+
+IF EXISTS (SELECT
+    *
+  FROM [tempdb].[sys].[objects]
+  WHERE [name] = N'##SQLskillsStats2')
+  DROP TABLE [##SQLskillsStats2];
+GO
