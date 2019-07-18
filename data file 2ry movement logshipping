@@ -1,3 +1,24 @@
+1.Ensure the last log copy and restore job has completed and then disable it.
+
+2.On the secondary SQL instance run the below command
+
+ALTER DATABASE Secondary_DB
+MODIFY FILE (NAME = datafile, FILENAME = 'new location')
+
+3. Shut down SQL secondary instance. (IF NOT ACTIVE DB RESIDES ON THIS INSTANCE)
+
+4.While SQL is down, manually copy the data or log files to new location you specified in the below command
+
+5. Once files are copied ust start your SQL instance.
+
+6.Make sure to re-enable your log copy and restore jobs
+
+
+
+
+
+
+
 step 1 : go to primary server db property connect 2ry  Database recovery mode will change to No recovery mode on next transaction log restore.
 ----https://www.mssqltips.com/sqlservertip/2836/steps-to-move-sql-server-log-shipping-secondary-database-files/
 
