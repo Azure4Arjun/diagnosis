@@ -1,0 +1,44 @@
+--All the following steps are to be performed on the principal server and not on mirrored server.
+--Step 1: Find the Logical and Physical File Details
+
+USE AdventureWorks2014 -- replace it with your database name
+GO
+SELECT name AS logical_name, physical_name
+FROM sys.database_files
+GO
+
+
+--Step 2: Move the Database Files to the new folder
+-- Data Files
+ALTER DATABASE AdventureWorks2014
+MODIFY FILE (NAME = AdventureWorks2014_Data,
+FILENAME = 'd:\data\AdventureWorks2014_Data.mdf');
+-- Log Files
+ALTER DATABASE AdventureWorks2014
+MODIFY FILE (NAME = AdventureWorks2014_Log,
+FILENAME = 'd:\data\AdventureWorks2014_Log.ldf')
+
+--Step 3: Stop the SQL Server service on Mirrored Database Instance.
+
+--This step is a very important step and do not miss this critical step on the mirrored database.
+
+--Step 4: Stop the SQL Server services on the Primary Instance
+
+--Step 5: Move the data and log files on the principal server.
+
+--Now is the easy part. Go to Windows Explorer and move all the data and log files for the database which you wanted to move.
+
+--Step 6: Restart SQL Server services on Primary Instance.
+
+--You may see your database in the brief period in the state of “In Recovery” and it will be back online very soon. If you see your database in the state of “Pending Recovery”, you should immediately reach out to SQL Server expert as there may be multiple reasons for this and expert may be able to help you out in this situation.
+
+--Step 7: Restart SQL Server services on mirrored Instance.
+
+--After a few moments, you should see your primary database mirrored and synchronized.
+
+--step 8: check new drive path
+USE AdventureWorks2014 -- replace it with your database name
+GO
+SELECT name AS logical_name, physical_name
+FROM sys.database_files
+GO
