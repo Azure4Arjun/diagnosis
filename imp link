@@ -1,0 +1,5 @@
+--partition
+https://github.com/microsoft/sql-server-samples/tree/master/samples/features/ssms-templates/Sql
+https://github.com/lucazav/SqlServerPartitionManagementUtility/blob/master/PartitionMgmtTest_2008.sql
+https://github.com/hanspo/PTF
+https://github.com/StrateSQL/sqlserver_indexanalysis/blob/master/sp_IndexAnalysis-SQLServer2008.sql
