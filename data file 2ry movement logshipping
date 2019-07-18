@@ -1,0 +1,22 @@
+step 1 : go to primary server db property connect 2ry  Database recovery mode will change to No recovery mode on next transaction log restore.
+----https://www.mssqltips.com/sqlservertip/2836/steps-to-move-sql-server-log-shipping-secondary-database-files/
+
+--Step 2: Once the secondary database state is changed to No Recovery Mode, disable the Log Shipping Restore Job on secondary server. 
+
+-- step3 Execute the below script on secondary server 
+-- Specify the secondary database, file name and new location
+ALTER DATABASE myLogShip 
+MODIFY FILE ( NAME = myLogShip, FILENAME = 'D:\SQLMonitor\myLogShip.mdf' );
+ALTER DATABASE myLogShip 
+MODIFY FILE ( NAME = myLogShip_Log, FILENAME = 'D:\SQLMonitor\myLogShip_Log.ldf' );
+
+
+--Step 4: Stop the Secondary SQL Server instance services. Go to SQL Server Configuration Manager and stop the secondary instance services.
+
+--Step 5: Move the Log Shipping Secondary database files to the new location in Windows Explorer as mentioned in step 3.
+
+--Step 6: Restart the secondary instance SQL Services in SQL Server Configuration Manager.
+
+--Step 7: Enable the Log Shipping database restore SQL Server Agent Job on the Secondary SQL Server see step 2 as a point of reference.
+
+Step 8: Verify the log shipping SQL Server Agent jobs are working properly.
