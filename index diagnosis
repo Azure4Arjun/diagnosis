@@ -1,0 +1,413 @@
+
+--index ALLOW_PAGE_LOCKS
+select 'alter INDEX [' + i.name + '] ON [' + s.name + '].[' + o.name + '] SET (ALLOW_PAGE_LOCKS = ON) --this is default'
+, * from sys.indexes i
+inner join sys.objects o on i.object_id  = o.object_id
+inner join sys.schemas s on s.schema_id = o.schema_id
+where allow_page_locks = 0
+and o.is_ms_shipped = 0
+
+
+-----------------------------------------------------------------------------------------------------------------------
+
+--Index/partitions in current database
+select SizeMb= (p.in_row_reserved_page_count*8.)/1024.
+,	indexname = i.name
+,	tablename = '[' + s.name + '].[' + o.name + ']'
+,	pr.data_compression_desc
+,	p.partition_number
+,  rebuildcompress = 
+CASE WHEN pr.data_compression_desc = 'columnstore' THEN NULL ELSE
+	'ALTER INDEX [' + i.name + '] ON [' + s.name + '].[' + o.name + '] REBUILD ' + 
+	CASE WHEN MAX(p.partition_number) OVER (PARTITION by i.name)  > 1 THEN 
+	'PARTITION = ' + cast(p.partition_number as varchar(5)) ELSE ''  END +
+	' WITH (SORT_IN_TEMPDB = ON
+	, DATA_COMPRESSION = PAGE) ' + CHAR(10) + CHAR(13)
+END
+, *
+from sys.dm_db_partition_stats p
+inner join sys.partitions pr on p.partition_id = pr.partition_id
+inner join sys.objects o on p.object_id = o.object_id 
+inner join sys.schemas s on s.schema_id = o.schema_id
+left outer join sys.indexes i on i.object_id = o.object_id and i.index_id = p.index_id
+WHERE o.is_ms_shipped = 0
+
+order by SizeMb desc
+
+
+
+-----------------------------------------------------------------------------------------------------------------------
+select 
+	[Database Name] = db_name()
+,	[Table Name]	= s.name + '.' + o.name
+,	[Column Name]	= c.name
+,	[Total_rows]	= sum(ps.row_count) 
+--Review the distribution of the data in the table
+,	[TSQL_Testing_Row_Distribution]	= 'select [' + c.name + '], count(1) from ['+ s.name + '].[' + o.name+'] group by [' + c.name + ']' 
+from 
+	sys.objects  o
+inner join 
+	sys.schemas s
+	on o.schema_id = s.schema_id
+inner join 
+	sys.dm_db_partition_stats ps
+	on ps.object_id = o.object_id
+	and index_id <= 1 --heap or cluster index, ignore NC indexes
+
+left outer join 
+	sys.columns c on c.object_id = o.object_id 
+left outer join 
+	sys.types t on c.user_type_id = t.user_type_id
+WHERE 
+	o.name <> 'dtproperties'
+and is_ms_shipped = 0
+and o.type = 'u'
+and (	c.name like 'is%' 
+	or	c.name like '%active%' 
+	or	c.name like '%ignore%' 
+	or	c.name like 'has%'
+	or	c.name like '%current%' 
+	or	c.name like '%archived%' 
+	or	c.name like '%flag%' 
+	or	c.name like '%bit%' 
+	or	t.name = 'bit' 
+	--Add any more known naming conventions here
+	)	
+group by c.name, s.name, o.name
+having sum(ps.row_count) > 100000
+order by [Total_rows] desc
+go
+
+--Existing filtered indexes
+SELECT 
+	[Database Name] = db_name()
+,	[Table Name]	= s.name + '.' + o.name
+,	[Index Name]	= i.name
+from 
+	sys.objects  o
+inner join 
+	sys.schemas s
+	on o.schema_id = s.schema_id
+inner join 
+	sys.indexes i
+	on i.object_id = o.object_id
+inner join 
+	sys.dm_db_partition_stats ps
+	on ps.object_id = o.object_id and ps.index_id = i.index_id
+WHERE
+	i.has_filter = 1
+ORDER BY
+	s.name, o.name, i.name
+
+
+/*
+--Potential Filtered index opportunities
+select iscurrentphase, count(1) from RepairOrderRepairPhases group by IsCurrentPhase
+select isEnabled, count(1) from dbo.Users group by IsEnabled
+select [ISPUBLIC], count(1) from [dbo].[TNOTE] group by [ISPUBLIC]
+--Potential filtered index
+CREATE INDEX IDX_NC_F_Testing on dbo.testtable (Whatever1, whatever2) INCLUDE (whatever3)
+WHERE IsActive = 1;
+*/
+
+---------------------------------------------------------------------------------------------------------------------
+--Finds objects to drop that the Database Tuning Advisor (DTA) leaves behind when it inevitably crashes.
+
+SELECT 'drop index [' + i.name+ '] on [' + schema_name(o.schema_id) + '].[' + object_name(i.[object_id]) + ']'
+FROM sys.indexes i
+INNER JOIN sys.objects o
+ON i.object_id = o.object_id
+WHERE 1=1 
+and o.is_ms_shipped = 0
+and o.type = 'u'
+and i.name is not null
+and i.is_hypothetical = 1 
+
+select 'drop statistics [' + schema_name(o.schema_id) + '].[' + object_name(i.[object_id]) + '].['+ i.[name] + ']'
+FROM sys.stats i
+inner join sys.objects o 
+on i.object_id = o.object_id 
+WHERE 1=1
+and o.is_ms_shipped = 0
+and o.type = 'u'
+and i.[name] LIKE '_dta%' 
+
+---------------------------------------------------------------------------------------------------------------------
+--Find duplicate indexes based on keysets and properties
+
+SELECT TableName, IndexName1, IndexName2
+, Idx_counter, Idx_first_counter, Keyset_counter, SizeMb
+,  [Drop_TSQL] = CASE	WHEN y.Idx_counter > 1 and Idx_first_counter = 1 
+	THEN 'IF EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID(N''' + TableName + ''') AND name = N''' + IndexName1 + ''')
+							DROP INDEX [' + IndexName1 + '] ON ' + TableName + ';' 
+	ELSE '' END
+FROM (
+	SELECT  TableName, IndexName1, IndexName2, SizeMb
+		,	Idx_counter = row_number() OVER (PARTITION BY TableName, IndexDefinition1 order by IndexName1, IndexName2)
+		,	Idx_first_counter = row_number() OVER (PARTITION BY IndexName1 ORDER BY IndexName1, TableName)
+		,	Keyset_counter = dense_rank() OVER ( ORDER BY IndexDefinition1)
+		FROM (
+			SELECT 
+			  TableName = '[' + sc.name + '].[' + o.name + ']'
+			, IndexName1 = i1.name, IndexName2 = i2.name
+			, IndexDefinition1= (select tablename = object_name(ic.object_id), --indexname = i.name, 
+					columnname = c.name,  is_descending_key = ic.is_descending_key, i.type_desc, is_included_column = ic.is_included_column, is_primary_key = i.is_primary_key, is_unique = i.is_unique, has_filter = i.has_filter, filter_definition  = isnull(filter_definition,'') from sys.index_columns ic
+					inner join sys.indexes i on i.index_id = ic.index_id and i.object_id = ic.object_id 
+					inner join sys.columns c on ic.object_id = c.object_id and ic.column_id = c.column_id 
+					where ic.index_id = i1.index_id and ic.object_id = o.object_id and i.index_id > 1
+					FOR XML AUTO) 
+			, IndexDefinition2= (select tablename = object_name(ic.object_id), --indexname = i.name, 
+					columnname = c.name, is_descending_key = ic.is_descending_key, i.type_desc, is_included_column = ic.is_included_column, is_primary_key = i.is_primary_key, is_unique = i.is_unique, has_filter = i.has_filter, filter_definition  = isnull(filter_definition,'') from sys.index_columns ic
+					inner join sys.indexes i on i.index_id = ic.index_id and i.object_id = ic.object_id 
+					inner join sys.columns c on ic.object_id = c.object_id and ic.column_id = c.column_id 
+					where ic.index_id = i2.index_id and ic.object_id = o.object_id and i.index_id > 1
+					FOR XML AUTO)
+			, SizeMb= (p.in_row_reserved_page_count*8.)/1024.
+			from sys.indexes i1 
+			inner join sys.indexes i2
+			on i1.object_id  = i2.object_id 
+			inner join sys.objects o 
+			on i1.object_id = o.object_id
+			inner join sys.schemas sc
+			on sc.schema_id = o.schema_id
+			inner join sys.dm_db_partition_stats p
+			on p.object_id = o.object_id
+			and p.index_id = i1.index_id 
+			WHERE 
+				i1.name <> i2.name
+			and i1.index_id <> i2.index_id
+			and (
+				UPPER(i1.name) = UPPER(i2.name) 
+				or 
+				(
+					(select tablename = object_name(ic.object_id), columnname = c.name, si.type_desc, is_descending_key = ic.is_descending_key, is_included_column = ic.is_included_column, is_primary_key = si.is_primary_key, is_unique = si.is_unique, has_filter = si.has_filter, filter_definition  = isnull(filter_definition,'')
+					from sys.index_columns ic
+					inner join sys.indexes si on si.index_id = ic.index_id and si.object_id = ic.object_id 
+					inner join sys.columns c on ic.object_id = c.object_id and ic.column_id = c.column_id 
+					where ic.index_id = i1.index_id and ic.object_id = o.object_id and si.index_id > 1
+					FOR XML AUTO)
+					= 
+					(select tablename = object_name(ic.object_id), columnname = c.name, si.type_desc, is_descending_key = ic.is_descending_key, is_included_column = ic.is_included_column, is_primary_key = si.is_primary_key, is_unique = si.is_unique, has_filter = si.has_filter, filter_definition  = isnull(filter_definition,'')
+					from sys.index_columns ic
+					inner join sys.indexes si on si.index_id = ic.index_id and si.object_id = ic.object_id 
+					inner join sys.columns c on ic.object_id = c.object_id and ic.column_id = c.column_id 
+					where ic.index_id = i2.index_id and ic.object_id = o.object_id and si.index_id > 1
+					FOR XML AUTO)
+				)
+			)
+	) x
+) y
+
+ORDER BY TableName, IndexName1, IndexName2
+
+
+/*
+IF EXISTS (SELECT * FROM sys.indexes WHERE object_id = OBJECT_ID(N'[dbo].[bAPPH]') AND name = N'biAPPHUniqueAttchID')
+			DROP INDEX [biAPPHUniqueAttchID] ON [dbo].[bAPPH];
+*/
+
+
+----------------------------------------------------------------------------------------------------------------------
+
+
+--Identify if fulltext catalog feature is installed
+--Skip this step in Azure SQL DB
+IF (SELECT FullText_Indexing_Is_Installed = fulltextserviceproperty('IsFullTextInstalled')) <> 1
+BEGIN
+	THROW 51000, 'Full text indexing is not installed.',0;
+END;
+GO
+
+--Identify databases with a fulltext catalog present
+--Skip this step in Azure SQL DB
+EXEC sp_MSforeachdb 'use[?]; select Database_name = DB_Name(), fc.name from sys.fulltext_catalogs fc'
+GO
+
+SELECT	
+		Fulltext_Catalog	= c.name
+    ,	Table_Name	= o.name
+    ,	Key_Index	= i.name
+	,   Catalog_Populate_Status = FULLTEXTCATALOGPROPERTY(c.name,'PopulateStatus')
+	,	Catalog_Populate_Status_Desc = 
+			(SELECT CASE FULLTEXTCATALOGPROPERTY(c.name,'PopulateStatus')
+						WHEN 0 THEN 'Idle' --caught up and keeping up
+						WHEN 1 THEN 'Full Population In Progress' --initial status upon creation
+						WHEN 2 THEN 'Paused'--PROBLEM?
+						WHEN 3 THEN 'Throttled'
+						WHEN 4 THEN 'Recovering'--PROBLEM
+						WHEN 5 THEN 'Shutdown'--PROBLEM
+						WHEN 6 THEN 'Incremental Population In Progress'
+						WHEN 7 THEN 'Building Index'
+						WHEN 8 THEN 'Disk Full.  Paused.' --PROBLEM
+						WHEN 9 THEN 'Change Tracking' --expected when it is catching up and not up to date yet
+					END) --https://docs.microsoft.com/en-us/sql/t-sql/functions/fulltextcatalogproperty-transact-sql
+	,	LastCrawlStart	= fi.crawl_start_date
+	,	LastCrawlEnd	= fi.crawl_end_date --null when currently crawling
+	,	fi.is_enabled 
+	,	c.is_default 
+	,	fi.crawl_type_desc
+    ,	fi.change_tracking_state_desc
+	,	fi.has_crawl_completed
+	,	c.is_importing -- Indicates whether the full-text catalog is being imported: 1 = The catalog is being imported. 2 = The catalog is not being imported.
+	
+FROM	sys.fulltext_catalogs c	
+    LEFT OUTER JOIN sys.fulltext_indexes fi ON fi.fulltext_catalog_id = c.fulltext_catalog_id
+	LEFT OUTER JOIN sys.objects o			ON o.[object_id] = fi.[object_id] 
+    LEFT OUTER JOIN sys.indexes i			ON fi.unique_index_id = i.index_id AND fi.[object_id] = i.[object_id]
+/*
+WHERE  (fi.crawl_end_date is null --is currently crawling
+  or fi.crawl_end_date < dateadd(day, -1, getdate())) --look for any ft index that hasn't updated recently
+*/
+ORDER	BY c.name, o.name, i.name, fi.crawl_start_date;
+
+--------------------------------------------------------------------------------------------------------------------------
+--index_usage_stats
+--Discover indexes that aren't helping reads but still hurting writes
+--Does not show tables that have never been written to
+
+SELECT  DatabaseName		= d.name
+	,	s.object_id
+	,	TableName 			= ' [' + sc.name + '].[' + o.name + ']'
+    ,   IndexName			= i.name
+    ,   s.user_seeks
+    ,   s.user_scans
+    ,   s.user_lookups
+    ,   s.user_updates
+	,	ps.row_count
+	,	SizeMb				= cast((ps.in_row_reserved_page_count*8.)/1024. as decimal(19,2))
+	,	s.last_user_lookup
+	,	s.last_user_scan
+	,	s.last_user_seek
+	,	s.last_user_update
+	,	Partition_Schema_Name = psch.[name]
+	,	Partition_Number = pr.partition_number
+	,	[tSQL]	= '--caution! DROP INDEX [' + i.name + '] ON [' + sc.name + '].[' + o.name + ']' --caution!!
+--select object_name(object_id), * 
+FROM	sys.dm_db_index_usage_stats s 
+        INNER JOIN sys.objects o
+			 ON o.object_id=s.object_id
+		inner join sys.schemas sc
+			on sc.schema_id = o.schema_id
+		INNER JOIN sys.indexes i
+           ON i.object_id = s.object_id
+              AND i.index_id = s.index_id
+		left outer join sys.partitions pr 
+			on pr.object_id = i.object_id 
+			and pr.index_id = i.index_id
+		left outer join sys.dm_db_partition_stats ps
+			on ps.object_id = i.object_id
+			and ps.partition_id = pr.partition_id
+		left outer join sys.partition_schemes psch 
+			on psch.data_space_id = i.data_space_id
+		inner join sys.databases d
+			on s.database_id = d.database_id
+			and db_name() = d.name
+WHERE 1=1 
+--Strongly recommended filters
+and o.is_ms_shipped = 0
+and o.type_desc = 'USER_TABLE'
+and i.type_desc = 'NONCLUSTERED'
+and is_unique = 0
+and is_primary_key = 0
+and is_unique_constraint = 0
+
+--Optional filters
+--and user_updates / 50. > (user_seeks + user_scans + user_lookups ) --arbitrary
+--and o.name in ('ContactBase')
+--and o.name not like '%cascade%'
+--and (ps.in_row_reserved_page_count) > 1280 --10mb
+
+order by user_seeks + user_scans + user_lookups  asc,  s.user_updates desc; --most useless indexes show up first
+
+
+SELECT servicename, status_desc, last_startup_time FROM sys.dm_server_services;
+GO
+
+-------------------------------------------------------------------------------------------------------------------------
+
+---missing indexes
+--Execute this version of the script for the current desired database context only.
+--Look below for an all-databases version that cannot build the CREATE statement.
+--Demo lab script to generate a missing index suggestion: toolbox\lab - missing index setup demo.sql
+
+SELECT 
+	mid.statement 
+/* --This block SQL 2017+ only
+,	create_index_statement_2017 =	'CREATE NONCLUSTERED INDEX IDX_NC_' + replace(t.name, ' ' ,'')
+	+ TRANSLATE(ISNULL(replace(mid.equality_columns, ' ' ,''),'') , '],[' ,' _ ') --Translate is only supported for SQL 2017+
+	+ TRANSLATE(ISNULL(replace(mid.inequality_columns, ' ' ,''),''), '],[' ,' _ ')
+	+ ' ON ' + statement 
+	+ ' (' + ISNULL (mid.equality_columns,'') 
+    + CASE WHEN mid.equality_columns IS NOT NULL AND mid.inequality_columns IS NOT NULL THEN ', ' ELSE '' END 
+    + ISNULL (mid.inequality_columns, '')
+	+ ')' 
+	+ ISNULL (' INCLUDE (' + mid.included_columns + ')', '')  COLLATE SQL_Latin1_General_CP1_CI_AS
+	--+ ISNULL (' WITH (ONLINE = ON, SORT_IN_TEMPDB = ON)', '')  COLLATE SQL_Latin1_General_CP1_CI_AS --For SQL Server Enterprise Only
+*/
+
+,	create_index_statement	=	'CREATE NONCLUSTERED INDEX IDX_NC_' + replace(t.name, ' ' ,'')
+	+ replace(replace(replace(ISNULL(replace(mid.equality_columns, ' ' ,''),'') , '],[' ,'_'),'[','_'),']','') 
+	+ replace(replace(replace(ISNULL(replace(mid.inequality_columns, ' ' ,''),''), '],[' ,'_'),'[','_'),']','') 
+	+ ' ON ' + statement 
+	+ ' (' + ISNULL (mid.equality_columns,'') 
+    + CASE WHEN mid.equality_columns IS NOT NULL AND mid.inequality_columns IS NOT NULL THEN ', ' ELSE '' END 
+    + ISNULL (mid.inequality_columns, '')
+	+ ')' 
+	+ ISNULL (' INCLUDE (' + mid.included_columns + ')', '')  COLLATE SQL_Latin1_General_CP1_CI_AS
+	--+ ISNULL (' WITH (ONLINE = ON, SORT_IN_TEMPDB = ON)', '')  COLLATE SQL_Latin1_General_CP1_CI_AS --For SQL Server Enterprise Only
+,	unique_compiles, migs.user_seeks, migs.user_scans, last_user_seek, migs.avg_total_user_cost, avg_user_impact
+, mid.equality_columns,  mid.inequality_columns, mid.included_columns
+, quartile
+--select *
+FROM sys.dm_db_missing_index_groups mig
+INNER JOIN 
+(select *, quartile = NTILE(4) OVER (ORDER BY avg_total_user_cost asc) from sys.dm_db_missing_index_group_stats) migs 
+ON migs.group_handle = mig.index_group_handle
+--and migs.quartile = 1 --get only the top 25% of suggestions based on cost.
+INNER JOIN sys.dm_db_missing_index_details mid 
+ON mig.index_handle = mid.index_handle
+inner join sys.tables t 
+on t.object_id = mid.object_id
+inner join sys.schemas s
+on s.schema_id = t.schema_id
+WHERE 1=1
+and mid.database_id = db_id()
+--and		(datediff(week, last_user_seek, getdate())) < 1
+--and		migs.unique_compiles > 1
+--and		migs.quartile >= 3
+--and		migs.user_seeks > 10
+--and		migs.avg_user_impact > 75
+--and		t.name like '%pt_time_salesorder_ids%'
+--order by avg_user_impact * avg_total_user_cost desc;
+order by create_index_statement;
+
+
+SELECT servicename, status_desc, last_startup_time FROM sys.dm_server_services;
+GO
+
+
+/*
+--All databases
+SELECT 
+	mid.statement
+,	unique_compiles, migs.user_seeks, migs.user_scans, last_user_seek, migs.avg_total_user_cost
+, avg_user_impact, mid.equality_columns,  mid.inequality_columns, mid.included_columns
+, quartile
+--select *
+FROM sys.dm_db_missing_index_groups mig
+INNER JOIN 
+(select *, quartile = NTILE(5) OVER (ORDER BY avg_total_user_cost asc) from sys.dm_db_missing_index_group_stats) migs 
+ON migs.group_handle = mig.index_group_handle
+--and migs.quartile = 1 --get only the top 20% of suggestions based on cost.
+INNER JOIN sys.dm_db_missing_index_details mid 
+ON mig.index_handle = mid.index_handle
+WHERE 1=1
+--and		(datediff(week, last_user_seek, getdate())) < 1
+--and		migs.unique_compiles > 1
+--and		migs.quartile >= 3
+--and		migs.user_seeks > 10
+--and		migs.avg_user_impact > 75
+order by avg_user_impact * avg_total_user_cost desc 
+*/
+
+-----------------------------------------------------------------------------------------------------------------------
