@@ -113,3 +113,182 @@ CREATE TABLE [dbo].[worstqueryplans](
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 */
+
+
+--02 - Single-use vs multi-use plans with storage space.sql
+--##############################################################################
+--
+-- SAMPLE SCRIPTS TO ACCOMPANY "SQL SERVER 2017 ADMINISTRATION INSIDE OUT"
+--
+-- © 2018 MICROSOFT PRESS
+--
+--##############################################################################
+--
+-- CHAPTER 9: PERFORMANCE TUNING SQL SERVER
+-- T-SQL SAMPLE 2
+--
+
+-- Measure ad hoc query plans
+SELECT 
+	PlanUse = CASE WHEN p.usecounts > 1 THEN '>1' ELSE '1' END
+	, PlanCount = COUNT(1) 
+	, SizeInMB = SUM(p.size_in_bytes / 1024. / 1024.)
+FROM sys.dm_exec_cached_plans p
+GROUP BY CASE WHEN p.usecounts > 1 THEN '>1' ELSE '1' END;
+
+---03 - Analyzing cached execution plans in aggregate.sql
+
+--##############################################################################
+--
+-- SAMPLE SCRIPTS TO ACCOMPANY "SQL SERVER 2017 ADMINISTRATION INSIDE OUT"
+--
+-- © 2018 MICROSOFT PRESS
+--
+--##############################################################################
+--
+-- CHAPTER 9: PERFORMANCE TUNING SQL SERVER
+-- T-SQL SAMPLE 3
+--
+
+-- Find long-running queries
+SELECT 
+	UseCount = p.usecounts
+	, PlanSize_KB  = p.size_in_bytes / 1024
+	, CPU_ms	   = qs.total_worker_time / 1000  
+	, Duration_ms  = qs.total_elapsed_time / 1000
+	, ObjectType   = p.cacheobjtype + ' (' + p.objtype + ')'
+	, DatabaseName = db_name(CONVERT(int, pa.value))
+	, txt.ObjectID
+	, qs.total_physical_reads
+	, qs.total_logical_writes
+	, qs.total_logical_reads
+	, qs.last_execution_time
+	, StatementText = REPLACE(REPLACE 
+                    (SUBSTRING (txt.[text], qs.statement_start_offset / 2 + 1, 
+                    CASE WHEN qs.statement_end_offset = -1 THEN LEN (CONVERT(nvarchar(max), txt.[text])) 
+                         ELSE qs.statement_end_offset / 2 - qs.statement_start_offset / 2 + 1 
+                    END), 
+                    CHAR(13), ' '), CHAR(10), ' ') 
+	, QueryPlan  = qp.query_plan	
+	, qs.plan_handle 
+FROM sys.dm_exec_query_stats qs 		
+	INNER JOIN sys.dm_exec_cached_plans p ON p.plan_handle = qs.plan_handle 
+	OUTER APPLY sys.dm_exec_plan_attributes (p.plan_handle) pa 
+	OUTER APPLY sys.dm_exec_sql_text (p.plan_handle) AS txt
+	OUTER APPLY sys.dm_exec_query_plan (p.plan_handle) qp
+WHERE pa.attribute = 'dbid' 
+ORDER BY qs.total_worker_time + qs.total_elapsed_time DESC;
+GO
+
+---01 - Observe blocking.sql
+
+--##############################################################################
+--
+-- SAMPLE SCRIPTS TO ACCOMPANY "SQL SERVER 2017 ADMINISTRATION INSIDE OUT"
+--
+-- © 2018 MICROSOFT PRESS
+--
+--##############################################################################
+--
+-- CHAPTER 9: PERFORMANCE TUNING SQL SERVER
+-- T-SQL SAMPLE 1
+--
+SELECT * 
+FROM sys.dm_exec_sessions s 
+	LEFT OUTER JOIN sys.dm_exec_requests r ON r.session_id = s.session_id;
+
+
+---01 - Query plans with early abort reasons.sql
+
+--##############################################################################
+--
+-- SAMPLE SCRIPTS TO ACCOMPANY "SQL SERVER 2017 ADMINISTRATION INSIDE OUT"
+--
+-- © 2018 MICROSOFT PRESS
+--
+--##############################################################################
+--
+-- CHAPTER 9: PERFORMANCE TUNING SQL SERVER
+-- EXTRA T-SQL SAMPLE 1
+--
+
+-- Query plans with Early Abort Reasons
+SELECT 
+	UseCount = p.usecounts
+	, PlanSize_KB = p.size_in_bytes / 1024
+	, CPU_ms	    = qs.total_worker_time / 1000  
+	, Duration_ms  = qs.total_elapsed_time / 1000
+	, ObjectType   = p.cacheobjtype + ' (' + p.objtype + ')'
+	, DatabaseName = db_name(convert(int, pa.value))
+	, txt.ObjectID
+,  qs.total_physical_reads
+,  qs.total_logical_writes
+,  qs.total_logical_reads
+,  qs.last_execution_time
+,  StatementText = REPLACE(REPLACE 
+                    (SUBSTRING (txt.[text], qs.statement_start_offset / 2 + 1,
+                    CASE WHEN qs.statement_end_offset = -1 THEN LEN (CONVERT(nvarchar(max), txt.[text])) 
+                         ELSE qs.statement_end_offset / 2 - qs.statement_start_offset / 2 + 1 
+                    END), 
+                    CHAR(13), ' '), CHAR(10), ' ') 
+,  QueryPlan  = qp.query_plan	
+,  qs.plan_handle 
+FROM sys.dm_exec_query_stats qs 		
+	INNER JOIN sys.dm_exec_cached_plans p ON p.plan_handle = qs.plan_handle 
+	OUTER APPLY sys.dm_exec_plan_attributes (p.plan_handle) pa 
+	OUTER APPLY sys.dm_exec_sql_text (p.plan_handle) AS txt
+	OUTER APPLY sys.dm_exec_query_plan (p.plan_handle) qp
+	CROSS APPLY sys.dm_exec_text_query_plan(p.plan_handle, qs.statement_start_offset, qs.statement_end_offset) AS tqp
+WHERE pa.attribute = 'dbid' 
+	AND tqp.query_plan LIKE '%StatementOptmEarlyAbortReason%'
+ORDER BY qs.total_worker_time + qs.total_elapsed_time DESC;
+GO
+
+--Chapter 09 - Performance tuning SQL Server
+
+--##############################################################################
+--
+-- SAMPLE SCRIPTS TO ACCOMPANY "SQL SERVER 2017 ADMINISTRATION INSIDE OUT"
+--
+-- © 2018 MICROSOFT PRESS
+--
+--##############################################################################
+--
+-- CHAPTER 9: PERFORMANCE TUNING SQL SERVER
+-- EXTRA T-SQL SAMPLE 2 (LAB)
+--
+
+-- In Connection 1, execute the following TSQL code:
+DROP TABLE IF EXISTS AnyTable;
+CREATE TABLE AnyTable (
+	id INT NOT NULL IDENTITY(1,1 ) PRIMARY KEY,
+	ANumber INT NOT NULL);
+GO
+
+INSERT INTO AnyTable (ANumber) VALUES (1),(3);
+GO 
+
+BEGIN TRAN Update1;
+
+UPDATE AnyTable 
+	SET ANumber = 4 where ANumber > 1;
+
+-- In Connection 2, execute the following TSQL code:
+SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
+BEGIN TRAN Update2;
+UPDATE AnyTable WITH (UPDLOCK)
+	SET ANumber = 4 where ANumber > 1;
+
+--Back in Connection 1, execute the following TSQL code:
+COMMIT TRAN Update1
+
+-- Note that Connection 2 immediately fails, returning the following error message:
+-- Msg 3960, Level 16, State 2, Line 8
+-- Snapshot isolation transaction aborted due to update conflict. You cannot use snapshot isolation to access table 'dbo.AnyTable' directly or indirectly in database 'test' to update, delete, or insert the row that has been modified or deleted by another transaction. Retry the transaction or change the isolation level for the update/delete statement.
+
+
+
+
+
+
+
