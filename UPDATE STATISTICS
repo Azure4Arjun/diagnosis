@@ -1,0 +1,10 @@
+SELECT TOP 500 t.name AS Tablename, s.name AS Stats, STATS_DATE(s.object_id, s.stats_id) AS LastStatsUpdate 
+FROM sys.stats s JOIN sys.tables t  ON s.object_id = t.OBJECT_ID
+ORDER BY t.name ASC,s.name DESC
+--UPDATE STATISTICS 
+
+--UPDATE STATISTICS [table_name] [index_name/statistics_name]
+
+SELECT 'UPDATE STATISTICS   [' +  t.name + ']'--  [' + s.name + ']' 
+FROM sys.stats s JOIN sys.tables t  ON s.object_id = t.OBJECT_ID
+ORDER BY t.name ASC,s.name DESC
