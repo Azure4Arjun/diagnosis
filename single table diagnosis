@@ -1,0 +1,31 @@
+select * from [dbo].[MER_QueAns_Bajaj]
+--select * from [dbo].[MER_Answer_Details]
+
+---find out count of table 
+select count(1) from [dbo].[MER_QueAns_Tata]--175944
+
+--find out less redundat column 
+select  distinct(SrNo) from [dbo].[MER_QueAns_Tata]
+
+
+---find out heap tabel 
+SELECT TOP 1000 o.name, i.type_desc, o.type_desc, o.create_date
+FROM sys.indexes i
+INNER JOIN sys.objects o
+ ON  i.object_id = o.object_id
+WHERE o.type_desc = 'USER_TABLE'
+AND i.type_desc = 'HEAP'
+ORDER BY o.name
+GO
+
+--find out single table fragmentation 
+
+SELECT  t.name 'TableName', i.name 'IndexName',frag.avg_fragmentation_in_percent 'Percent Fragmented'
+FROM    sys.dm_db_index_physical_stats (DB_ID(), NULL, NULL, NULL, NULL) frag
+JOIN    sys.tables t ON      frag.object_id = t.object_id
+JOIN    sys.indexes i ON      frag.index_id = i.index_id
+AND     frag.object_id = i.object_id WHERE   frag.page_count > 1000--changed here
+AND     frag.avg_fragmentation_in_percent > 30--changed here
+AND     i.type != 0
+AND     t.name != 'MER_QueAns_Bajaj'
+ORDER BY frag.avg_fragmentation_in_percent DESC
